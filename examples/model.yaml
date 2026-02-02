@@ -1,0 +1,16 @@
+name: toy-transformer
+n_layers: 2
+d_model: 64
+n_heads: 8
+ffn_type: mlp
+ffn_expansion: 4.0
+
+draft_policy:
+  default:
+    qkv: draft
+    wo: draft
+    ffn: draft
+  per_layer:
+    0:
+      qkv: full
+
