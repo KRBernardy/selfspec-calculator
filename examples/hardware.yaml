@@ -1,30 +1,10 @@
 reuse_policy: reuse
+library: puma_like_v1
 
-costs:
-  analog_draft:
-    energy_pj_per_mac: 0.001
-    latency_ns_per_mac: 0.001
-  analog_full:
-    energy_pj_per_mac: 0.002
-    latency_ns_per_mac: 0.0015
-  analog_verify_reuse:
-    energy_pj_per_mac: 0.0006
-    latency_ns_per_mac: 0.0008
-
-  digital_attention:
-    energy_pj_per_mac: 0.0004
-    latency_ns_per_mac: 0.0007
-  digital_softmax:
-    energy_pj_per_mac: 0.00005
-    latency_ns_per_mac: 0.00005
-  digital_elementwise:
-    energy_pj_per_mac: 0.00002
-    latency_ns_per_mac: 0.00002
-  kv_cache:
-    energy_pj_per_mac: 0.0001
-    latency_ns_per_mac: 0.0001
-
-  analog_weight_area:
-    area_mm2_per_weight: 0.000000001
-  digital_overhead_area_mm2_per_layer: 0.01
-
+analog:
+  xbar_size: 128
+  num_columns_per_adc: 16
+  dac_bits: 4
+  adc:
+    draft_bits: 4
+    residual_bits: 12

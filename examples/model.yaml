@@ -2,6 +2,7 @@ name: toy-transformer
 n_layers: 2
 d_model: 64
 n_heads: 8
+activation_bits: 12
 ffn_type: mlp
 ffn_expansion: 4.0
 
@@ -13,4 +14,3 @@ draft_policy:
   per_layer:
     0:
       qkv: full
-

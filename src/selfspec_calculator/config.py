@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
-from pydantic import ValidationError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 
 class FfnType(str, Enum):
@@ -38,6 +37,7 @@ class ModelConfig(BaseModel):
     n_layers: int = Field(..., ge=1)
     d_model: int = Field(..., ge=1)
     n_heads: int = Field(..., ge=1)
+    activation_bits: int = Field(..., ge=1)
     ffn_type: FfnType = FfnType.mlp
     d_ff: int | None = Field(default=None, ge=1)
     ffn_expansion: float | None = Field(default=4.0, ge=1.0)
@@ -82,6 +82,11 @@ class ReusePolicy(str, Enum):
     reread = "reread"
 
 
+class HardwareMode(str, Enum):
+    legacy = "legacy"
+    knob_based = "knob-based"
+
+
 class PerMacCost(BaseModel):
     energy_pj_per_mac: float = Field(..., ge=0.0)
     latency_ns_per_mac: float = Field(..., ge=0.0)
@@ -103,9 +108,215 @@ class HardwareCosts(BaseModel):
     digital_overhead_area_mm2_per_layer: float = Field(0.0, ge=0.0)
 
 
+class AdcResolutionConfig(BaseModel):
+    draft_bits: int = Field(..., ge=1)
+    residual_bits: int = Field(..., ge=1)
+
+
+class AnalogKnobs(BaseModel):
+    xbar_size: int = Field(..., ge=1)
+    num_columns_per_adc: int = Field(..., ge=1)
+    dac_bits: int = Field(..., ge=1)
+    adc: AdcResolutionConfig
+
+    @model_validator(mode="after")
+    def _validate_divisibility(self) -> "AnalogKnobs":
+        if self.xbar_size % self.num_columns_per_adc != 0:
+            raise ValueError(
+                f"analog.xbar_size ({self.xbar_size}) must be divisible by "
+                f"analog.num_columns_per_adc ({self.num_columns_per_adc})"
+            )
+        return self
+
+
+class PeripheralSpec(BaseModel):
+    energy_pj_per_conversion: float = Field(..., ge=0.0)
+    latency_ns_per_conversion: float = Field(..., ge=0.0)
+    area_mm2_per_unit: float = Field(..., ge=0.0)
+
+
+class AnalogArraySpec(BaseModel):
+    energy_pj_per_activation: float = Field(..., ge=0.0)
+    latency_ns_per_activation: float = Field(..., ge=0.0)
+    area_mm2_per_weight: float = Field(..., ge=0.0)
+
+
+class DigitalCostDefaults(BaseModel):
+    attention: PerMacCost
+    softmax: PerMacCost
+    elementwise: PerMacCost
+    kv_cache: PerMacCost
+    digital_overhead_area_mm2_per_layer: float = Field(0.0, ge=0.0)
+
+
+class ResolvedKnobSpecs(BaseModel):
+    library: str
+    dac_bits: int
+    adc_draft_bits: int
+    adc_residual_bits: int
+    dac: PeripheralSpec
+    adc_draft: PeripheralSpec
+    adc_residual: PeripheralSpec
+    array: AnalogArraySpec
+    digital: DigitalCostDefaults
+
+
 class HardwareConfig(BaseModel):
     reuse_policy: ReusePolicy = ReusePolicy.reuse
-    costs: HardwareCosts
+    library: str | None = None
+    analog: AnalogKnobs | None = None
+    costs: HardwareCosts | None = None
+
+    DEFAULT_LIBRARY: ClassVar[str] = "puma_like_v1"
+    LIBRARIES: ClassVar[dict[str, dict[str, Any]]] = {
+        "puma_like_v1": {
+            "adc": {
+                3: {"energy_pj_per_conversion": 0.07, "latency_ns_per_conversion": 0.030, "area_mm2_per_unit": 0.0012},
+                4: {"energy_pj_per_conversion": 0.09, "latency_ns_per_conversion": 0.040, "area_mm2_per_unit": 0.0012},
+                5: {"energy_pj_per_conversion": 0.11, "latency_ns_per_conversion": 0.050, "area_mm2_per_unit": 0.0013},
+                8: {"energy_pj_per_conversion": 0.18, "latency_ns_per_conversion": 0.080, "area_mm2_per_unit": 0.0015},
+                10: {"energy_pj_per_conversion": 0.26, "latency_ns_per_conversion": 0.100, "area_mm2_per_unit": 0.0017},
+                11: {"energy_pj_per_conversion": 0.31, "latency_ns_per_conversion": 0.110, "area_mm2_per_unit": 0.0018},
+                12: {"energy_pj_per_conversion": 0.37, "latency_ns_per_conversion": 0.120, "area_mm2_per_unit": 0.0019},
+                13: {"energy_pj_per_conversion": 0.44, "latency_ns_per_conversion": 0.135, "area_mm2_per_unit": 0.0020},
+                16: {"energy_pj_per_conversion": 0.66, "latency_ns_per_conversion": 0.180, "area_mm2_per_unit": 0.0024},
+            },
+            "dac": {
+                1: {"energy_pj_per_conversion": 0.0035, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+                2: {"energy_pj_per_conversion": 0.0037, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+                4: {"energy_pj_per_conversion": 0.0040, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+                8: {"energy_pj_per_conversion": 0.0045, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+                12: {"energy_pj_per_conversion": 0.0050, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+                16: {"energy_pj_per_conversion": 0.0055, "latency_ns_per_conversion": 0.010, "area_mm2_per_unit": 1.67e-7},
+            },
+            "array": {
+                "energy_pj_per_activation": 0.0022,
+                "latency_ns_per_activation": 0.015,
+                "area_mm2_per_weight": 1.0e-9,
+            },
+            "digital": {
+                "attention": {"energy_pj_per_mac": 0.0004, "latency_ns_per_mac": 0.0007},
+                "softmax": {"energy_pj_per_mac": 0.00005, "latency_ns_per_mac": 0.00005},
+                "elementwise": {"energy_pj_per_mac": 0.00002, "latency_ns_per_mac": 0.00002},
+                "kv_cache": {"energy_pj_per_mac": 0.0001, "latency_ns_per_mac": 0.0001},
+                "digital_overhead_area_mm2_per_layer": 0.01,
+            },
+        },
+        "puma_like_v2": {
+            "adc": {
+                3: {"energy_pj_per_conversion": 0.06, "latency_ns_per_conversion": 0.028, "area_mm2_per_unit": 0.0011},
+                4: {"energy_pj_per_conversion": 0.08, "latency_ns_per_conversion": 0.036, "area_mm2_per_unit": 0.0011},
+                5: {"energy_pj_per_conversion": 0.10, "latency_ns_per_conversion": 0.045, "area_mm2_per_unit": 0.0012},
+                8: {"energy_pj_per_conversion": 0.16, "latency_ns_per_conversion": 0.072, "area_mm2_per_unit": 0.0014},
+                10: {"energy_pj_per_conversion": 0.23, "latency_ns_per_conversion": 0.092, "area_mm2_per_unit": 0.0016},
+                11: {"energy_pj_per_conversion": 0.27, "latency_ns_per_conversion": 0.102, "area_mm2_per_unit": 0.0017},
+                12: {"energy_pj_per_conversion": 0.33, "latency_ns_per_conversion": 0.113, "area_mm2_per_unit": 0.0018},
+                13: {"energy_pj_per_conversion": 0.39, "latency_ns_per_conversion": 0.124, "area_mm2_per_unit": 0.0019},
+                16: {"energy_pj_per_conversion": 0.59, "latency_ns_per_conversion": 0.166, "area_mm2_per_unit": 0.0022},
+            },
+            "dac": {
+                1: {"energy_pj_per_conversion": 0.0032, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+                2: {"energy_pj_per_conversion": 0.0034, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+                4: {"energy_pj_per_conversion": 0.0037, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+                8: {"energy_pj_per_conversion": 0.0042, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+                12: {"energy_pj_per_conversion": 0.0047, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+                16: {"energy_pj_per_conversion": 0.0052, "latency_ns_per_conversion": 0.009, "area_mm2_per_unit": 1.50e-7},
+            },
+            "array": {
+                "energy_pj_per_activation": 0.0019,
+                "latency_ns_per_activation": 0.013,
+                "area_mm2_per_weight": 9.0e-10,
+            },
+            "digital": {
+                "attention": {"energy_pj_per_mac": 0.00035, "latency_ns_per_mac": 0.00060},
+                "softmax": {"energy_pj_per_mac": 0.000045, "latency_ns_per_mac": 0.000045},
+                "elementwise": {"energy_pj_per_mac": 0.000018, "latency_ns_per_mac": 0.000018},
+                "kv_cache": {"energy_pj_per_mac": 0.00009, "latency_ns_per_mac": 0.00009},
+                "digital_overhead_area_mm2_per_layer": 0.009,
+            },
+        },
+    }
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> "HardwareConfig":
+        has_analog = self.analog is not None
+        has_costs = self.costs is not None
+        if has_analog and has_costs:
+            raise ValueError("hardware config is ambiguous: do not mix analog.* knob fields with legacy costs.*")
+        if not has_analog and not has_costs:
+            raise ValueError("hardware config must provide either analog.* knobs or legacy costs.*")
+        if has_analog:
+            self.resolve_knob_specs()
+        return self
+
+    @property
+    def mode(self) -> HardwareMode:
+        if self.analog is not None:
+            return HardwareMode.knob_based
+        return HardwareMode.legacy
+
+    @property
+    def selected_library(self) -> str:
+        return self.library or self.DEFAULT_LIBRARY
+
+    def resolve_knob_specs(self) -> ResolvedKnobSpecs:
+        if self.mode != HardwareMode.knob_based:
+            raise ValueError("Cannot resolve knob specs for legacy costs.* config")
+
+        library_name = self.selected_library
+        lib = self.LIBRARIES.get(library_name)
+        if lib is None:
+            raise ValueError(
+                f"Unknown hardware library '{library_name}'. "
+                f"Available: {', '.join(sorted(self.LIBRARIES))}"
+            )
+
+        assert self.analog is not None
+        adc_table: dict[int, dict[str, Any]] = lib["adc"]
+        dac_table: dict[int, dict[str, Any]] = lib["dac"]
+
+        draft_bits = self.analog.adc.draft_bits
+        residual_bits = self.analog.adc.residual_bits
+        dac_bits = self.analog.dac_bits
+
+        if draft_bits not in adc_table:
+            raise ValueError(
+                f"Requested analog.adc.draft_bits={draft_bits} is not available in library '{library_name}'. "
+                f"Available ADC bits: {sorted(adc_table)}"
+            )
+        if residual_bits not in adc_table:
+            raise ValueError(
+                f"Requested analog.adc.residual_bits={residual_bits} is not available in library '{library_name}'. "
+                f"Available ADC bits: {sorted(adc_table)}"
+            )
+        if dac_bits not in dac_table:
+            raise ValueError(
+                f"Requested analog.dac_bits={dac_bits} is not available in library '{library_name}'. "
+                f"Available DAC bits: {sorted(dac_table)}"
+            )
+
+        return ResolvedKnobSpecs(
+            library=library_name,
+            dac_bits=dac_bits,
+            adc_draft_bits=draft_bits,
+            adc_residual_bits=residual_bits,
+            dac=PeripheralSpec.model_validate(dac_table[dac_bits]),
+            adc_draft=PeripheralSpec.model_validate(adc_table[draft_bits]),
+            adc_residual=PeripheralSpec.model_validate(adc_table[residual_bits]),
+            array=AnalogArraySpec.model_validate(lib["array"]),
+            digital=DigitalCostDefaults.model_validate(lib["digital"]),
+        )
+
+    def resolved_library_payload(self) -> dict[str, Any] | None:
+        if self.mode != HardwareMode.knob_based:
+            return None
+        specs = self.resolve_knob_specs()
+        return {
+            "name": specs.library,
+            "dac": {"bits": specs.dac_bits, **specs.dac.model_dump(mode="json")},
+            "adc_draft": {"bits": specs.adc_draft_bits, **specs.adc_draft.model_dump(mode="json")},
+            "adc_residual": {"bits": specs.adc_residual_bits, **specs.adc_residual.model_dump(mode="json")},
+        }
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "HardwareConfig":

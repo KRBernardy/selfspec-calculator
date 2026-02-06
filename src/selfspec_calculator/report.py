@@ -83,13 +83,88 @@ class StageBreakdown(BaseModel):
         raise KeyError(stage)
 
 
+class ComponentBreakdown(BaseModel):
+    arrays_energy_pj: float = 0.0
+    arrays_latency_ns: float = 0.0
+    dac_energy_pj: float = 0.0
+    dac_latency_ns: float = 0.0
+    adc_draft_energy_pj: float = 0.0
+    adc_draft_latency_ns: float = 0.0
+    adc_residual_energy_pj: float = 0.0
+    adc_residual_latency_ns: float = 0.0
+
+    attention_engine_energy_pj: float = 0.0
+    attention_engine_latency_ns: float = 0.0
+    kv_cache_energy_pj: float = 0.0
+    kv_cache_latency_ns: float = 0.0
+    softmax_unit_energy_pj: float = 0.0
+    softmax_unit_latency_ns: float = 0.0
+    elementwise_unit_energy_pj: float = 0.0
+    elementwise_unit_latency_ns: float = 0.0
+    buffers_add_energy_pj: float = 0.0
+    buffers_add_latency_ns: float = 0.0
+    control_energy_pj: float = 0.0
+    control_latency_ns: float = 0.0
+
+    def plus(self, other: "ComponentBreakdown") -> "ComponentBreakdown":
+        return self.model_copy(
+            update={field: getattr(self, field) + getattr(other, field) for field in type(self).model_fields}
+        )
+
+    def add_energy_latency(self, component: str, energy_pj: float, latency_ns: float) -> "ComponentBreakdown":
+        prefix = {
+            "arrays": "arrays",
+            "dac": "dac",
+            "adc_draft": "adc_draft",
+            "adc_residual": "adc_residual",
+            "attention_engine": "attention_engine",
+            "kv_cache": "kv_cache",
+            "softmax_unit": "softmax_unit",
+            "elementwise_unit": "elementwise_unit",
+            "buffers_add": "buffers_add",
+            "control": "control",
+        }.get(component)
+        if prefix is None:
+            raise KeyError(component)
+        return self.model_copy(
+            update={
+                f"{prefix}_energy_pj": getattr(self, f"{prefix}_energy_pj") + energy_pj,
+                f"{prefix}_latency_ns": getattr(self, f"{prefix}_latency_ns") + latency_ns,
+            }
+        )
+
+
+class AnalogActivationCounts(BaseModel):
+    array_activations: float = Field(0.0, ge=0.0)
+    dac_conversions: float = Field(0.0, ge=0.0)
+    adc_draft_conversions: float = Field(0.0, ge=0.0)
+    adc_residual_conversions: float = Field(0.0, ge=0.0)
+
+    def plus(self, other: "AnalogActivationCounts") -> "AnalogActivationCounts":
+        return self.model_copy(
+            update={field: getattr(self, field) + getattr(other, field) for field in type(self).model_fields}
+        )
+
+    def scale(self, factor: float) -> "AnalogActivationCounts":
+        return self.model_copy(
+            update={field: getattr(self, field) * factor for field in type(self).model_fields}
+        )
+
+
 class Breakdown(BaseModel):
     energy_pj: float = Field(..., ge=0.0)
     latency_ns: float = Field(..., ge=0.0)
     stages: StageBreakdown
+    components: ComponentBreakdown | None = None
+    activation_counts: AnalogActivationCounts | None = None
 
     @classmethod
-    def from_stage_breakdown(cls, stages: StageBreakdown) -> "Breakdown":
+    def from_stage_breakdown(
+        cls,
+        stages: StageBreakdown,
+        components: ComponentBreakdown | None = None,
+        activation_counts: AnalogActivationCounts | None = None,
+    ) -> "Breakdown":
         energy = sum(
             getattr(stages, f"{s}_energy_pj")
             for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"]
@@ -98,9 +173,25 @@ class Breakdown(BaseModel):
             getattr(stages, f"{s}_latency_ns")
             for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"]
         )
-        return cls(energy_pj=energy, latency_ns=latency, stages=stages)
+        return cls(
+            energy_pj=energy,
+            latency_ns=latency,
+            stages=stages,
+            components=components,
+            activation_counts=activation_counts,
+        )
 
     def scale(self, factor: float) -> "Breakdown":
+        components = None
+        if self.components is not None:
+            components = self.components.model_copy(
+                update={
+                    field: getattr(self.components, field) * factor for field in type(self.components).model_fields
+                }
+            )
+        activation_counts = None
+        if self.activation_counts is not None:
+            activation_counts = self.activation_counts.scale(factor)
         return Breakdown(
             energy_pj=self.energy_pj * factor,
             latency_ns=self.latency_ns * factor,
@@ -111,6 +202,8 @@ class Breakdown(BaseModel):
                     for m in ["energy_pj", "latency_ns"]
                 }
             ),
+            components=components,
+            activation_counts=activation_counts,
         )
 
 
@@ -134,6 +227,10 @@ class Report(BaseModel):
     generated_at: str
     k: int = Field(..., ge=0)
     reuse_policy: str
+    hardware_mode: str
+    resolved_library: dict[str, Any] | None = None
+    model_knobs: dict[str, Any] | None = None
+    hardware_knobs: dict[str, Any] | None = None
     paths: InputPaths | None = None
     points: list[SweepPoint]
     break_even_tokens_per_joule_l_prompt: int | None = None
