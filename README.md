@@ -49,6 +49,55 @@ analog:
     residual_bits: 12
 ```
 
+Optional SoC extensions (all optional; default to zero/disabled so older configs keep working):
+
+```yaml
+soc:
+  schedule: serialized  # or: layer-pipelined
+  verify_setup:
+    energy_pj_per_burst: 0.0
+    latency_ns_per_burst: 0.0
+  buffers_add:
+    energy_pj_per_op: 0.0
+    latency_ns_per_op: 0.0
+  control:
+    energy_pj_per_token: 0.0
+    latency_ns_per_token: 0.0
+    energy_pj_per_burst: 0.0
+    latency_ns_per_burst: 0.0
+
+memory:
+  # Enables bytes-based KV-cache modeling (SRAM buffer + off-chip HBM + fabric).
+  sram:
+    read_energy_pj_per_byte: 0.0
+    write_energy_pj_per_byte: 0.0
+    read_bandwidth_GBps: 0.0
+    write_bandwidth_GBps: 0.0
+    read_latency_ns: 0.0
+    write_latency_ns: 0.0
+  hbm: { ...same fields... }
+  fabric: { ...same fields... }
+  kv_cache:
+    hbm:
+      value_bytes_per_elem: 1
+      scale_bytes: 2
+      scales_per_token_per_head: 2
+    # sram: { ...optional override... }
+
+analog:
+  periphery:
+    tia: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+    snh: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+    mux: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+    io_buffers: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+    subarray_switches: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+    write_drivers: { energy_pj_per_op: 0.0, latency_ns_per_op: 0.0 }
+```
+
+Examples:
+- `examples/hardware_soc_memory.yaml` (SRAM + HBM + fabric KV-cache model)
+- `examples/hardware_analog_periphery.yaml` (non-zero analog periphery + buffers/control)
+
 Validation rules:
 - `xbar_size`, `num_columns_per_adc`, `dac_bits`, `draft_bits`, and `residual_bits` must be positive integers.
 - `xbar_size % num_columns_per_adc == 0`.
@@ -66,6 +115,8 @@ Keep existing `costs.*` format (see `examples/hardware_legacy.yaml`).
 The JSON report includes:
 - stage-level breakdown (`qkv`, `wo`, `ffn`, `qk`, `pv`, `softmax`, `elementwise`, `kv_cache`),
 - component-level breakdown (`arrays`, `dac`, `adc_draft`, `adc_residual`, attention/digital components),
+- optional SoC components (`buffers_add`, `control`, and analog periphery blocks),
+- optional memory components (`sram`, `hbm`, `fabric`) and `memory_traffic` bytes,
 - resolved library entries (for knob-based runs),
 - analog activation counts (`dac_conversions`, `adc_*_conversions`, etc.) for knob-based runs,
 - baseline/delta and break-even fields compatible with previous outputs.
@@ -73,7 +124,10 @@ The JSON report includes:
 ## Modeling assumptions
 
 - This project is an analytical calculator (closed-form counting), not an event/instruction simulator.
-- Draft/Verify are serialized per burst.
+- Draft/Verify are serialized per burst (no early-stop on mismatch; wasted verifier suffix work is still charged).
+- When `memory` is configured:
+  - HBM KV reads are not mismatch-gated in v1.
+  - HBM KV writes are commit-only (Policy B).
 - Full-read dual-ADC latency uses parallel timing:
   - energy sums ADC-Draft + ADC-Residual,
   - latency uses `max(adc_draft_scan, adc_residual_scan)`.

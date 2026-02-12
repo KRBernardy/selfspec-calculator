@@ -87,6 +87,11 @@ class HardwareMode(str, Enum):
     knob_based = "knob-based"
 
 
+class ScheduleMode(str, Enum):
+    serialized = "serialized"
+    layer_pipelined = "layer-pipelined"
+
+
 class PerMacCost(BaseModel):
     energy_pj_per_mac: float = Field(..., ge=0.0)
     latency_ns_per_mac: float = Field(..., ge=0.0)
@@ -113,11 +118,27 @@ class AdcResolutionConfig(BaseModel):
     residual_bits: int = Field(..., ge=1)
 
 
+class PerOpOverheadSpec(BaseModel):
+    energy_pj_per_op: float = Field(0.0, ge=0.0)
+    latency_ns_per_op: float = Field(0.0, ge=0.0)
+    area_mm2_per_unit: float = Field(0.0, ge=0.0)
+
+
+class AnalogPeripheryKnobs(BaseModel):
+    tia: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    snh: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    mux: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    io_buffers: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    subarray_switches: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    write_drivers: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+
+
 class AnalogKnobs(BaseModel):
     xbar_size: int = Field(..., ge=1)
     num_columns_per_adc: int = Field(..., ge=1)
     dac_bits: int = Field(..., ge=1)
     adc: AdcResolutionConfig
+    periphery: AnalogPeripheryKnobs = Field(default_factory=AnalogPeripheryKnobs)
 
     @model_validator(mode="after")
     def _validate_divisibility(self) -> "AnalogKnobs":
@@ -139,6 +160,56 @@ class AnalogArraySpec(BaseModel):
     energy_pj_per_activation: float = Field(..., ge=0.0)
     latency_ns_per_activation: float = Field(..., ge=0.0)
     area_mm2_per_weight: float = Field(..., ge=0.0)
+
+
+class VerifySetupKnobs(BaseModel):
+    energy_pj_per_burst: float = Field(0.0, ge=0.0)
+    latency_ns_per_burst: float = Field(0.0, ge=0.0)
+
+
+class ControlOverheadKnobs(BaseModel):
+    energy_pj_per_token: float = Field(0.0, ge=0.0)
+    latency_ns_per_token: float = Field(0.0, ge=0.0)
+    energy_pj_per_burst: float = Field(0.0, ge=0.0)
+    latency_ns_per_burst: float = Field(0.0, ge=0.0)
+
+
+class SocKnobs(BaseModel):
+    schedule: ScheduleMode = ScheduleMode.serialized
+    verify_setup: VerifySetupKnobs = Field(default_factory=VerifySetupKnobs)
+    buffers_add: PerOpOverheadSpec = Field(default_factory=PerOpOverheadSpec)
+    control: ControlOverheadKnobs = Field(default_factory=ControlOverheadKnobs)
+
+
+class MemoryTechKnobs(BaseModel):
+    read_energy_pj_per_byte: float = Field(0.0, ge=0.0)
+    write_energy_pj_per_byte: float = Field(0.0, ge=0.0)
+    read_bandwidth_GBps: float = Field(0.0, ge=0.0)
+    write_bandwidth_GBps: float = Field(0.0, ge=0.0)
+    read_latency_ns: float = Field(0.0, ge=0.0)
+    write_latency_ns: float = Field(0.0, ge=0.0)
+    area_mm2: float = Field(0.0, ge=0.0)
+
+
+class KvCacheFormatKnobs(BaseModel):
+    value_bytes_per_elem: int = Field(1, ge=0)
+    scale_bytes: int = Field(2, ge=0)
+    scales_per_token_per_head: int = Field(2, ge=0)
+
+
+class KvCacheMemoryKnobs(BaseModel):
+    hbm: KvCacheFormatKnobs = Field(default_factory=KvCacheFormatKnobs)
+    sram: KvCacheFormatKnobs | None = None
+
+    def resolved_sram(self) -> KvCacheFormatKnobs:
+        return self.sram or self.hbm
+
+
+class MemoryKnobs(BaseModel):
+    sram: MemoryTechKnobs = Field(default_factory=MemoryTechKnobs)
+    hbm: MemoryTechKnobs = Field(default_factory=MemoryTechKnobs)
+    fabric: MemoryTechKnobs = Field(default_factory=MemoryTechKnobs)
+    kv_cache: KvCacheMemoryKnobs = Field(default_factory=KvCacheMemoryKnobs)
 
 
 class DigitalCostDefaults(BaseModel):
@@ -164,6 +235,8 @@ class ResolvedKnobSpecs(BaseModel):
 class HardwareConfig(BaseModel):
     reuse_policy: ReusePolicy = ReusePolicy.reuse
     library: str | None = None
+    soc: SocKnobs = Field(default_factory=SocKnobs)
+    memory: MemoryKnobs | None = None
     analog: AnalogKnobs | None = None
     costs: HardwareCosts | None = None
 

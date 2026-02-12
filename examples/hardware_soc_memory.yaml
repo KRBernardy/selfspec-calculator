@@ -1,0 +1,41 @@
+reuse_policy: reuse
+library: puma_like_v1
+
+memory:
+  # Bytes-based KV-cache model (Policy B): HBM writes are commit-only.
+  sram:
+    read_energy_pj_per_byte: 0.1
+    write_energy_pj_per_byte: 0.2
+    read_bandwidth_GBps: 2000.0
+    write_bandwidth_GBps: 2000.0
+    read_latency_ns: 5.0
+    write_latency_ns: 5.0
+  hbm:
+    read_energy_pj_per_byte: 1.0
+    write_energy_pj_per_byte: 2.0
+    read_bandwidth_GBps: 1000.0
+    write_bandwidth_GBps: 1000.0
+    read_latency_ns: 100.0
+    write_latency_ns: 200.0
+  fabric:
+    read_energy_pj_per_byte: 0.01
+    write_energy_pj_per_byte: 0.01
+    read_bandwidth_GBps: 2000.0
+    write_bandwidth_GBps: 2000.0
+    read_latency_ns: 10.0
+    write_latency_ns: 10.0
+  kv_cache:
+    # INT8 KV with per-head scale metadata in the traffic model.
+    hbm:
+      value_bytes_per_elem: 1
+      scale_bytes: 2
+      scales_per_token_per_head: 2
+    # sram: null  # defaults to the HBM KV format
+
+analog:
+  xbar_size: 128
+  num_columns_per_adc: 16
+  dac_bits: 4
+  adc:
+    draft_bits: 4
+    residual_bits: 12

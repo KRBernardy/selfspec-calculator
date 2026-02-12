@@ -12,12 +12,14 @@ from .config import (
     PrecisionMode,
     ReusePolicy,
     ResolvedKnobSpecs,
+    ScheduleMode,
 )
 from .report import (
     AnalogActivationCounts,
     BaselineDelta,
     Breakdown,
     ComponentBreakdown,
+    MemoryTraffic,
     Metrics,
     PhaseBreakdown,
     Report,
@@ -29,6 +31,146 @@ from .stats import SpeculationStats, expected_committed_tokens_per_burst
 
 ANALOG_STAGES = ("qkv", "wo", "ffn")
 DIGITAL_STAGES = ("qk", "pv", "softmax", "elementwise", "kv_cache")
+
+
+def _kv_bytes_per_token_per_layer(*, d_model: int, n_heads: int, fmt) -> int:  # noqa: ANN001
+    payload_bytes = 2 * d_model * int(fmt.value_bytes_per_elem)
+    metadata_bytes = n_heads * int(fmt.scales_per_token_per_head) * int(fmt.scale_bytes)
+    return payload_bytes + metadata_bytes
+
+
+def _mem_energy_latency(*, tech, read_bytes: float, write_bytes: float) -> tuple[float, float]:  # noqa: ANN001
+    energy = read_bytes * tech.read_energy_pj_per_byte + write_bytes * tech.write_energy_pj_per_byte
+
+    latency = 0.0
+    if read_bytes > 0:
+        if tech.read_bandwidth_GBps > 0:
+            latency += read_bytes / tech.read_bandwidth_GBps
+        latency += tech.read_latency_ns
+    if write_bytes > 0:
+        if tech.write_bandwidth_GBps > 0:
+            latency += write_bytes / tech.write_bandwidth_GBps
+        latency += tech.write_latency_ns
+
+    return energy, latency
+
+
+def _kv_memory_traffic_by_phase(
+    *,
+    model: ModelConfig,
+    hardware: HardwareConfig,
+    stats: SpeculationStats,
+    l_prompt: int,
+) -> dict[str, MemoryTraffic]:
+    if hardware.memory is None:
+        z = MemoryTraffic()
+        return {"draft": z, "verify_drafted": z, "verify_bonus": z}
+
+    k = stats.k
+    n_layers = model.n_layers
+    d_model = model.d_model
+    n_heads = model.n_heads
+
+    fmt_hbm = hardware.memory.kv_cache.hbm
+    fmt_sram = hardware.memory.kv_cache.resolved_sram()
+
+    bytes_hbm_token = _kv_bytes_per_token_per_layer(d_model=d_model, n_heads=n_heads, fmt=fmt_hbm)
+    bytes_sram_token = _kv_bytes_per_token_per_layer(d_model=d_model, n_heads=n_heads, fmt=fmt_sram)
+
+    def tokens_to_bytes(tokens: float, bytes_per_token: int) -> float:
+        return float(tokens) * float(n_layers) * float(bytes_per_token)
+
+    # HBM reads: base context (prompt) is always served from HBM; no mismatch gating in v1.
+    hbm_read_per_step_bytes = tokens_to_bytes(l_prompt, bytes_hbm_token)
+    draft_hbm_read = float(k) * hbm_read_per_step_bytes
+    verify_drafted_hbm_read = float(k) * hbm_read_per_step_bytes
+    verify_bonus_hbm_read = 1.0 * hbm_read_per_step_bytes
+
+    # SRAM traffic: speculative within-burst KV buffer.
+    if k <= 0:
+        draft_sram_read = 0.0
+        verify_drafted_sram_read = 0.0
+        verify_bonus_sram_read = 0.0
+        draft_sram_write = 0.0
+        verify_drafted_sram_write = 0.0
+        verify_bonus_sram_write = 0.0
+    else:
+        draft_sram_read = tokens_to_bytes(k * (k - 1) / 2.0, bytes_sram_token)
+        verify_drafted_sram_read = tokens_to_bytes(k * (k - 1) / 2.0, bytes_sram_token)
+        verify_bonus_sram_read = tokens_to_bytes(float(k), bytes_sram_token)
+
+        draft_sram_write = tokens_to_bytes(float(k), bytes_sram_token)
+        verify_drafted_sram_write = tokens_to_bytes(float(k), bytes_sram_token)
+        verify_bonus_sram_write = tokens_to_bytes(1.0, bytes_sram_token)
+
+    # HBM writes: commit-only (policy B).
+    committed_tokens = expected_committed_tokens_per_burst(stats)
+    hbm_write = tokens_to_bytes(committed_tokens, bytes_hbm_token)
+
+    draft = MemoryTraffic(
+        sram_read_bytes=draft_sram_read,
+        sram_write_bytes=draft_sram_write,
+        hbm_read_bytes=draft_hbm_read,
+        hbm_write_bytes=0.0,
+    )
+    verify_drafted = MemoryTraffic(
+        sram_read_bytes=verify_drafted_sram_read,
+        sram_write_bytes=verify_drafted_sram_write,
+        hbm_read_bytes=verify_drafted_hbm_read,
+        hbm_write_bytes=0.0,
+    )
+    verify_bonus = MemoryTraffic(
+        sram_read_bytes=verify_bonus_sram_read,
+        sram_write_bytes=verify_bonus_sram_write,
+        hbm_read_bytes=verify_bonus_hbm_read,
+        hbm_write_bytes=hbm_write,
+    )
+
+    # Fabric: model as bytes moved for both SRAM and HBM traffic (conservative, configurable by energy/byte and BW).
+    for traffic in (draft, verify_drafted, verify_bonus):
+        traffic.fabric_read_bytes = traffic.sram_read_bytes + traffic.hbm_read_bytes
+        traffic.fabric_write_bytes = traffic.sram_write_bytes + traffic.hbm_write_bytes
+
+    return {"draft": draft, "verify_drafted": verify_drafted, "verify_bonus": verify_bonus}
+
+
+def _add_memory_traffic_costs(
+    *,
+    breakdown: Breakdown,
+    traffic: MemoryTraffic,
+    hardware: HardwareConfig,
+) -> Breakdown:
+    if hardware.memory is None:
+        return breakdown
+
+    sram_e, sram_t = _mem_energy_latency(
+        tech=hardware.memory.sram, read_bytes=traffic.sram_read_bytes, write_bytes=traffic.sram_write_bytes
+    )
+    hbm_e, hbm_t = _mem_energy_latency(
+        tech=hardware.memory.hbm, read_bytes=traffic.hbm_read_bytes, write_bytes=traffic.hbm_write_bytes
+    )
+    fabric_e, fabric_t = _mem_energy_latency(
+        tech=hardware.memory.fabric,
+        read_bytes=traffic.fabric_read_bytes,
+        write_bytes=traffic.fabric_write_bytes,
+    )
+
+    mem_energy = sram_e + hbm_e + fabric_e
+    mem_latency = sram_t + hbm_t + fabric_t
+
+    stages = breakdown.stages.add_energy_latency("kv_cache", mem_energy, mem_latency)
+
+    components = breakdown.components or ComponentBreakdown()
+    components = components.add_energy_latency("sram", sram_e, sram_t)
+    components = components.add_energy_latency("hbm", hbm_e, hbm_t)
+    components = components.add_energy_latency("fabric", fabric_e, fabric_t)
+
+    return Breakdown.from_stage_breakdown(
+        stages,
+        components=components,
+        activation_counts=breakdown.activation_counts,
+        memory_traffic=traffic,
+    )
 
 
 def _mac_counts_per_token(model: ModelConfig, l_prompt: int) -> dict[str, int]:
@@ -143,6 +285,10 @@ def _legacy_components_from_stages(stages: StageBreakdown) -> ComponentBreakdown
         softmax_unit_latency_ns=stages.softmax_latency_ns,
         elementwise_unit_energy_pj=stages.elementwise_energy_pj,
         elementwise_unit_latency_ns=stages.elementwise_latency_ns,
+        buffers_add_energy_pj=stages.buffers_add_energy_pj,
+        buffers_add_latency_ns=stages.buffers_add_latency_ns,
+        control_energy_pj=stages.control_energy_pj,
+        control_latency_ns=stages.control_latency_ns,
     )
 
 
@@ -174,6 +320,9 @@ def _area_mm2(model: ModelConfig, hardware: HardwareConfig) -> StageBreakdown:
 def _token_step_costs_legacy(model: ModelConfig, hardware: HardwareConfig, l_prompt: int) -> tuple[Breakdown, Breakdown]:
     macs = _mac_counts_per_token(model, l_prompt)
     digital_costs = _digital_costs_legacy(hardware)
+    digital_stages = DIGITAL_STAGES if hardware.memory is None else tuple(s for s in DIGITAL_STAGES if s != "kv_cache")
+    analog_outputs = {s: sum(m_out for m_out, _n_in in shapes) for s, shapes in _analog_stage_shapes(model).items()}
+    buf_knobs = hardware.soc.buffers_add
 
     def stage_energy_latency(stage: str, energy_per_mac: float, latency_per_mac: float) -> tuple[float, float]:
         m = macs[stage]
@@ -197,11 +346,45 @@ def _token_step_costs_legacy(model: ModelConfig, hardware: HardwareConfig, l_pro
             )
             verify_full_stage = verify_full_stage.add_energy_latency(block, e_full, t_full)
 
-        for stage in DIGITAL_STAGES:
+            outputs = float(analog_outputs[block])
+            if hardware.reuse_policy == ReusePolicy.reuse:
+                draft_stage = draft_stage.add_energy_latency(
+                    "buffers_add",
+                    outputs * buf_knobs.energy_pj_per_op,
+                    outputs * buf_knobs.latency_ns_per_op,
+                )
+            if precision == PrecisionMode.full:
+                draft_stage = draft_stage.add_energy_latency(
+                    "buffers_add",
+                    outputs * buf_knobs.energy_pj_per_op,
+                    outputs * buf_knobs.latency_ns_per_op,
+                )
+            verify_full_stage = verify_full_stage.add_energy_latency(
+                "buffers_add",
+                outputs * buf_knobs.energy_pj_per_op,
+                outputs * buf_knobs.latency_ns_per_op,
+            )
+
+        for stage in digital_stages:
             e_per, t_per = digital_costs[stage]
             e, t = stage_energy_latency(stage, e_per, t_per)
             draft_stage = draft_stage.add_energy_latency(stage, e, t)
             verify_full_stage = verify_full_stage.add_energy_latency(stage, e, t)
+
+    ctrl_e_tok = model.n_layers * hardware.soc.control.energy_pj_per_token
+    ctrl_t_tok = model.n_layers * hardware.soc.control.latency_ns_per_token
+    draft_stage = draft_stage.add_energy_latency("control", ctrl_e_tok, ctrl_t_tok)
+    verify_full_stage = verify_full_stage.add_energy_latency("control", ctrl_e_tok, ctrl_t_tok)
+
+    ctrl_e_burst = model.n_layers * hardware.soc.control.energy_pj_per_burst
+    ctrl_t_burst = model.n_layers * hardware.soc.control.latency_ns_per_burst
+    setup_e_burst = model.n_layers * hardware.soc.verify_setup.energy_pj_per_burst
+    setup_t_burst = model.n_layers * hardware.soc.verify_setup.latency_ns_per_burst
+    verify_full_stage = verify_full_stage.add_energy_latency(
+        "control",
+        ctrl_e_burst + setup_e_burst,
+        ctrl_t_burst + setup_t_burst,
+    )
 
     return (
         Breakdown.from_stage_breakdown(draft_stage, components=_legacy_components_from_stages(draft_stage)),
@@ -217,6 +400,9 @@ def _verify_drafted_token_additional_stage_legacy(
 ) -> Breakdown:
     macs = _mac_counts_per_token(model, l_prompt)
     digital_costs = _digital_costs_legacy(hardware)
+    digital_stages = DIGITAL_STAGES if hardware.memory is None else tuple(s for s in DIGITAL_STAGES if s != "kv_cache")
+    analog_outputs = {s: sum(m_out for m_out, _n_in in shapes) for s, shapes in _analog_stage_shapes(model).items()}
+    buf_knobs = hardware.soc.buffers_add
 
     additional = StageBreakdown()
 
@@ -226,9 +412,34 @@ def _verify_drafted_token_additional_stage_legacy(
             e_per, t_per = _verify_additional_cost_for_block(hardware, executed_precision, token_kind="drafted")
             additional = additional.add_energy_latency(block, macs[block] * e_per, macs[block] * t_per)
 
-        for stage in DIGITAL_STAGES:
+            outputs = float(analog_outputs[block])
+            if hardware.reuse_policy == ReusePolicy.reread:
+                additional = additional.add_energy_latency(
+                    "buffers_add",
+                    outputs * buf_knobs.energy_pj_per_op,
+                    outputs * buf_knobs.latency_ns_per_op,
+                )
+            else:
+                if executed_precision == PrecisionMode.full:
+                    additional = additional.add_energy_latency(
+                        "buffers_add",
+                        outputs * buf_knobs.energy_pj_per_op,
+                        outputs * buf_knobs.latency_ns_per_op,
+                    )
+                else:
+                    additional = additional.add_energy_latency(
+                        "buffers_add",
+                        2.0 * outputs * buf_knobs.energy_pj_per_op,
+                        2.0 * outputs * buf_knobs.latency_ns_per_op,
+                    )
+
+        for stage in digital_stages:
             e_per, t_per = digital_costs[stage]
             additional = additional.add_energy_latency(stage, macs[stage] * e_per, macs[stage] * t_per)
+
+    ctrl_e_tok = model.n_layers * hardware.soc.control.energy_pj_per_token
+    ctrl_t_tok = model.n_layers * hardware.soc.control.latency_ns_per_token
+    additional = additional.add_energy_latency("control", ctrl_e_tok, ctrl_t_tok)
 
     return Breakdown.from_stage_breakdown(additional, components=_legacy_components_from_stages(additional))
 
@@ -333,6 +544,7 @@ def _add_knob_analog_stage(
     xbar_size: int,
     adc_steps: int,
     specs: ResolvedKnobSpecs,
+    periphery: Any,  # AnalogPeripheryKnobs
     mode_name: str,
 ) -> None:
     active_arrays, use_adc_draft, use_adc_residual = _analog_mode(mode_name)
@@ -360,14 +572,37 @@ def _add_knob_analog_stage(
     )
     adc_draft_latency, adc_residual_latency, adc_latency = _parallel_latency_split(adc_draft_scan, adc_residual_scan)
 
+    # Optional analog periphery (TIA, SNH, muxing, buffering, switches, drivers).
+    outputs = dac_conversions
+    scan_steps = base_reads * adc_steps
+
+    def periph_energy_latency(spec, *, energy_ops: float, latency_ops: float) -> tuple[float, float]:  # noqa: ANN001
+        return (energy_ops * spec.energy_pj_per_op, latency_ops * spec.latency_ns_per_op)
+
+    tia_e, tia_t = periph_energy_latency(periphery.tia, energy_ops=outputs, latency_ops=scan_steps)
+    snh_e, snh_t = periph_energy_latency(periphery.snh, energy_ops=outputs, latency_ops=scan_steps)
+    mux_e, mux_t = periph_energy_latency(periphery.mux, energy_ops=outputs, latency_ops=scan_steps)
+    io_e, io_t = periph_energy_latency(periphery.io_buffers, energy_ops=outputs, latency_ops=scan_steps)
+    sw_e, sw_t = periph_energy_latency(periphery.subarray_switches, energy_ops=array_activations, latency_ops=base_reads)
+    wd_e, wd_t = periph_energy_latency(periphery.write_drivers, energy_ops=outputs, latency_ops=scan_steps)
+
     stage_energy = array_energy + dac_energy + adc_draft_energy + adc_residual_energy
     stage_latency = array_latency + dac_latency + adc_latency
+
+    stage_energy += tia_e + snh_e + mux_e + io_e + sw_e + wd_e
+    stage_latency += tia_t + snh_t + mux_t + io_t + sw_t + wd_t
 
     acc.add_stage(stage, stage_energy, stage_latency)
     acc.add_component("arrays", array_energy, array_latency)
     acc.add_component("dac", dac_energy, dac_latency)
     acc.add_component("adc_draft", adc_draft_energy, adc_draft_latency)
     acc.add_component("adc_residual", adc_residual_energy, adc_residual_latency)
+    acc.add_component("tia", tia_e, tia_t)
+    acc.add_component("snh", snh_e, snh_t)
+    acc.add_component("mux", mux_e, mux_t)
+    acc.add_component("io_buffers", io_e, io_t)
+    acc.add_component("subarray_switches", sw_e, sw_t)
+    acc.add_component("write_drivers", wd_e, wd_t)
     acc.add_analog_counts(
         array_activations=array_activations,
         dac_conversions=dac_conversions,
@@ -406,8 +641,18 @@ def _token_step_costs_knob(
     assert hardware.analog is not None
     macs = _mac_counts_per_token(model, l_prompt)
     digital_costs = _digital_costs_knob(specs)
+    digital_stages = DIGITAL_STAGES if hardware.memory is None else tuple(s for s in DIGITAL_STAGES if s != "kv_cache")
     num_tiles = _tile_counts(model, hardware.analog.xbar_size)
     num_slices = ceil(model.activation_bits / hardware.analog.dac_bits)
+    buf_knobs = hardware.soc.buffers_add
+
+    def add_buffers_add(acc: _TokenAccumulator, ops: float) -> None:
+        if ops <= 0.0:
+            return
+        energy = ops * buf_knobs.energy_pj_per_op
+        latency = ops * buf_knobs.latency_ns_per_op
+        acc.add_stage("buffers_add", energy, latency)
+        acc.add_component("buffers_add", energy, latency)
 
     draft = _TokenAccumulator()
     verify_full = _TokenAccumulator()
@@ -423,6 +668,7 @@ def _token_step_costs_knob(
                 xbar_size=hardware.analog.xbar_size,
                 adc_steps=hardware.analog.num_columns_per_adc,
                 specs=specs,
+                periphery=hardware.analog.periphery,
                 mode_name="draft_full" if precision == PrecisionMode.full else "draft_default",
             )
             _add_knob_analog_stage(
@@ -433,10 +679,18 @@ def _token_step_costs_knob(
                 xbar_size=hardware.analog.xbar_size,
                 adc_steps=hardware.analog.num_columns_per_adc,
                 specs=specs,
+                periphery=hardware.analog.periphery,
                 mode_name="verify_bonus",
             )
 
-        for stage in DIGITAL_STAGES:
+            outputs = float(num_tiles[stage] * num_slices * hardware.analog.xbar_size)
+            if hardware.reuse_policy == ReusePolicy.reuse:
+                add_buffers_add(draft, outputs)  # buffer D_reg / full outputs for reuse
+            if precision == PrecisionMode.full:
+                add_buffers_add(draft, outputs)  # ADC-output combine
+            add_buffers_add(verify_full, outputs)  # ADC-output combine (bonus token)
+
+        for stage in digital_stages:
             e_per, t_per = digital_costs[stage]
             _add_knob_digital_stage(acc=draft, stage=stage, macs=macs[stage], energy_per_mac=e_per, latency_per_mac=t_per)
             _add_knob_digital_stage(
@@ -446,6 +700,23 @@ def _token_step_costs_knob(
                 energy_per_mac=e_per,
                 latency_per_mac=t_per,
             )
+
+    ctrl_e_tok = model.n_layers * hardware.soc.control.energy_pj_per_token
+    ctrl_t_tok = model.n_layers * hardware.soc.control.latency_ns_per_token
+    draft.add_stage("control", ctrl_e_tok, ctrl_t_tok)
+    draft.add_component("control", ctrl_e_tok, ctrl_t_tok)
+    verify_full.add_stage("control", ctrl_e_tok, ctrl_t_tok)
+    verify_full.add_component("control", ctrl_e_tok, ctrl_t_tok)
+
+    ctrl_e_burst = model.n_layers * hardware.soc.control.energy_pj_per_burst
+    ctrl_t_burst = model.n_layers * hardware.soc.control.latency_ns_per_burst
+    verify_full.add_stage("control", ctrl_e_burst, ctrl_t_burst)
+    verify_full.add_component("control", ctrl_e_burst, ctrl_t_burst)
+
+    setup_e_burst = model.n_layers * hardware.soc.verify_setup.energy_pj_per_burst
+    setup_t_burst = model.n_layers * hardware.soc.verify_setup.latency_ns_per_burst
+    verify_full.add_stage("control", setup_e_burst, setup_t_burst)
+    verify_full.add_component("control", setup_e_burst, setup_t_burst)
 
     return draft.to_breakdown(), verify_full.to_breakdown()
 
@@ -459,8 +730,18 @@ def _verify_drafted_token_additional_stage_knob(
     assert hardware.analog is not None
     macs = _mac_counts_per_token(model, l_prompt)
     digital_costs = _digital_costs_knob(specs)
+    digital_stages = DIGITAL_STAGES if hardware.memory is None else tuple(s for s in DIGITAL_STAGES if s != "kv_cache")
     num_tiles = _tile_counts(model, hardware.analog.xbar_size)
     num_slices = ceil(model.activation_bits / hardware.analog.dac_bits)
+    buf_knobs = hardware.soc.buffers_add
+
+    def add_buffers_add(acc: _TokenAccumulator, ops: float) -> None:
+        if ops <= 0.0:
+            return
+        energy = ops * buf_knobs.energy_pj_per_op
+        latency = ops * buf_knobs.latency_ns_per_op
+        acc.add_stage("buffers_add", energy, latency)
+        acc.add_component("buffers_add", energy, latency)
 
     additional = _TokenAccumulator()
 
@@ -483,10 +764,20 @@ def _verify_drafted_token_additional_stage_knob(
                 xbar_size=hardware.analog.xbar_size,
                 adc_steps=hardware.analog.num_columns_per_adc,
                 specs=specs,
+                periphery=hardware.analog.periphery,
                 mode_name=mode_name,
             )
 
-        for stage in DIGITAL_STAGES:
+            outputs = float(num_tiles[stage] * num_slices * hardware.analog.xbar_size)
+            if hardware.reuse_policy == ReusePolicy.reread:
+                add_buffers_add(additional, outputs)  # ADC-output combine (re-read full)
+            else:
+                if executed_precision == PrecisionMode.full:
+                    add_buffers_add(additional, outputs)  # buffer read of stored full outputs
+                else:
+                    add_buffers_add(additional, 2.0 * outputs)  # buffer read + Final = D_reg + C
+
+        for stage in digital_stages:
             e_per, t_per = digital_costs[stage]
             _add_knob_digital_stage(
                 acc=additional,
@@ -495,6 +786,11 @@ def _verify_drafted_token_additional_stage_knob(
                 energy_per_mac=e_per,
                 latency_per_mac=t_per,
             )
+
+    ctrl_e_tok = model.n_layers * hardware.soc.control.energy_pj_per_token
+    ctrl_t_tok = model.n_layers * hardware.soc.control.latency_ns_per_token
+    additional.add_stage("control", ctrl_e_tok, ctrl_t_tok)
+    additional.add_component("control", ctrl_e_tok, ctrl_t_tok)
 
     return additional.to_breakdown()
 
@@ -517,22 +813,23 @@ def estimate_point(
         draft_step, verify_full_step = _token_step_costs_knob(model, hardware, specs, l_prompt)
         verify_drafted_additional = _verify_drafted_token_additional_stage_knob(model, hardware, specs, l_prompt)
 
-    e_burst = draft_step.energy_pj * stats.k + verify_drafted_additional.energy_pj * stats.k + verify_full_step.energy_pj
-    t_burst = draft_step.latency_ns * stats.k + verify_drafted_additional.latency_ns * stats.k + verify_full_step.latency_ns
-
-    committed = expected_committed_tokens_per_burst(stats)
-    if committed <= 0:
-        raise ValueError("Expected committed tokens per burst must be > 0")
-
-    energy_per_token_pj = e_burst / committed
-    latency_per_token_ns = t_burst / committed
-
-    throughput_tokens_per_s = 0.0 if latency_per_token_ns == 0 else 1e9 / latency_per_token_ns
-    tokens_per_joule = 0.0 if energy_per_token_pj == 0 else 1e12 / energy_per_token_pj
-
     draft_phase = draft_step.scale(stats.k)
     verify_drafted_phase = verify_drafted_additional.scale(stats.k)
     verify_bonus_phase = verify_full_step
+
+    if hardware.memory is not None:
+        traffic = _kv_memory_traffic_by_phase(model=model, hardware=hardware, stats=stats, l_prompt=l_prompt)
+        draft_phase = _add_memory_traffic_costs(breakdown=draft_phase, traffic=traffic["draft"], hardware=hardware)
+        verify_drafted_phase = _add_memory_traffic_costs(
+            breakdown=verify_drafted_phase,
+            traffic=traffic["verify_drafted"],
+            hardware=hardware,
+        )
+        verify_bonus_phase = _add_memory_traffic_costs(
+            breakdown=verify_bonus_phase,
+            traffic=traffic["verify_bonus"],
+            hardware=hardware,
+        )
 
     total_stages = draft_phase.stages.plus(verify_drafted_phase.stages).plus(verify_bonus_phase.stages)
 
@@ -556,11 +853,39 @@ def estimate_point(
             draft_phase.activation_counts.plus(verify_drafted_phase.activation_counts).plus(verify_bonus_phase.activation_counts)
         )
 
+    total_memory_traffic = None
+    if (
+        draft_phase.memory_traffic is not None
+        and verify_drafted_phase.memory_traffic is not None
+        and verify_bonus_phase.memory_traffic is not None
+    ):
+        total_memory_traffic = (
+            draft_phase.memory_traffic.plus(verify_drafted_phase.memory_traffic).plus(verify_bonus_phase.memory_traffic)
+        )
+
     total_phase = Breakdown.from_stage_breakdown(
         total_stages,
         components=total_components,
         activation_counts=total_activation_counts,
+        memory_traffic=total_memory_traffic,
     )
+
+    e_burst = total_phase.energy_pj
+    t_burst = total_phase.latency_ns
+
+    committed = expected_committed_tokens_per_burst(stats)
+    if committed <= 0:
+        raise ValueError("Expected committed tokens per burst must be > 0")
+
+    energy_per_token_pj = e_burst / committed
+    latency_per_token_ns = t_burst / committed
+
+    if hardware.soc.schedule == ScheduleMode.layer_pipelined:
+        latency_per_token_ns = latency_per_token_ns / model.n_layers
+
+    throughput_tokens_per_s = 0.0 if latency_per_token_ns == 0 else 1e9 / latency_per_token_ns
+    tokens_per_joule = 0.0 if energy_per_token_pj == 0 else 1e12 / energy_per_token_pj
+
     breakdown = PhaseBreakdown(
         draft=draft_phase,
         verify_drafted=verify_drafted_phase,
@@ -632,6 +957,36 @@ def estimate_sweep(
                 },
             }
         )
+        periph = hardware.analog.periphery
+        if any(
+            getattr(getattr(periph, name), field) != 0.0
+            for name in ["tia", "snh", "mux", "io_buffers", "subarray_switches", "write_drivers"]
+            for field in ["energy_pj_per_op", "latency_ns_per_op", "area_mm2_per_unit"]
+        ):
+            hardware_knobs["analog_periphery"] = periph.model_dump(mode="json")
+
+    if hardware.memory is not None:
+        hardware_knobs["memory"] = hardware.memory.model_dump(mode="json")
+
+    if (
+        hardware.soc.schedule != ScheduleMode.serialized
+        or hardware.soc.verify_setup.energy_pj_per_burst != 0.0
+        or hardware.soc.verify_setup.latency_ns_per_burst != 0.0
+        or any(
+            getattr(hardware.soc.buffers_add, field) != 0.0
+            for field in ["energy_pj_per_op", "latency_ns_per_op", "area_mm2_per_unit"]
+        )
+        or any(
+            getattr(hardware.soc.control, field) != 0.0
+            for field in [
+                "energy_pj_per_token",
+                "latency_ns_per_token",
+                "energy_pj_per_burst",
+                "latency_ns_per_burst",
+            ]
+        )
+    ):
+        hardware_knobs["soc"] = hardware.soc.model_dump(mode="json")
 
     return Report(
         generated_at=datetime.now(timezone.utc).isoformat(),

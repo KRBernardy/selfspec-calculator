@@ -63,6 +63,10 @@ class StageBreakdown(BaseModel):
     elementwise_latency_ns: float = 0.0
     kv_cache_energy_pj: float = 0.0
     kv_cache_latency_ns: float = 0.0
+    buffers_add_energy_pj: float = 0.0
+    buffers_add_latency_ns: float = 0.0
+    control_energy_pj: float = 0.0
+    control_latency_ns: float = 0.0
 
     qkv_mm2: float = 0.0
     wo_mm2: float = 0.0
@@ -76,7 +80,7 @@ class StageBreakdown(BaseModel):
 
     def add_energy_latency(self, stage: str, energy_pj: float, latency_ns: float) -> "StageBreakdown":
         update: dict[str, Any] = {}
-        if stage in {"qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"}:
+        if stage in {"qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache", "buffers_add", "control"}:
             update[f"{stage}_energy_pj"] = getattr(self, f"{stage}_energy_pj") + energy_pj
             update[f"{stage}_latency_ns"] = getattr(self, f"{stage}_latency_ns") + latency_ns
             return self.model_copy(update=update)
@@ -92,11 +96,29 @@ class ComponentBreakdown(BaseModel):
     adc_draft_latency_ns: float = 0.0
     adc_residual_energy_pj: float = 0.0
     adc_residual_latency_ns: float = 0.0
+    tia_energy_pj: float = 0.0
+    tia_latency_ns: float = 0.0
+    snh_energy_pj: float = 0.0
+    snh_latency_ns: float = 0.0
+    mux_energy_pj: float = 0.0
+    mux_latency_ns: float = 0.0
+    io_buffers_energy_pj: float = 0.0
+    io_buffers_latency_ns: float = 0.0
+    subarray_switches_energy_pj: float = 0.0
+    subarray_switches_latency_ns: float = 0.0
+    write_drivers_energy_pj: float = 0.0
+    write_drivers_latency_ns: float = 0.0
 
     attention_engine_energy_pj: float = 0.0
     attention_engine_latency_ns: float = 0.0
     kv_cache_energy_pj: float = 0.0
     kv_cache_latency_ns: float = 0.0
+    sram_energy_pj: float = 0.0
+    sram_latency_ns: float = 0.0
+    hbm_energy_pj: float = 0.0
+    hbm_latency_ns: float = 0.0
+    fabric_energy_pj: float = 0.0
+    fabric_latency_ns: float = 0.0
     softmax_unit_energy_pj: float = 0.0
     softmax_unit_latency_ns: float = 0.0
     elementwise_unit_energy_pj: float = 0.0
@@ -117,8 +139,17 @@ class ComponentBreakdown(BaseModel):
             "dac": "dac",
             "adc_draft": "adc_draft",
             "adc_residual": "adc_residual",
+            "tia": "tia",
+            "snh": "snh",
+            "mux": "mux",
+            "io_buffers": "io_buffers",
+            "subarray_switches": "subarray_switches",
+            "write_drivers": "write_drivers",
             "attention_engine": "attention_engine",
             "kv_cache": "kv_cache",
+            "sram": "sram",
+            "hbm": "hbm",
+            "fabric": "fabric",
             "softmax_unit": "softmax_unit",
             "elementwise_unit": "elementwise_unit",
             "buffers_add": "buffers_add",
@@ -151,12 +182,30 @@ class AnalogActivationCounts(BaseModel):
         )
 
 
+class MemoryTraffic(BaseModel):
+    sram_read_bytes: float = Field(0.0, ge=0.0)
+    sram_write_bytes: float = Field(0.0, ge=0.0)
+    hbm_read_bytes: float = Field(0.0, ge=0.0)
+    hbm_write_bytes: float = Field(0.0, ge=0.0)
+    fabric_read_bytes: float = Field(0.0, ge=0.0)
+    fabric_write_bytes: float = Field(0.0, ge=0.0)
+
+    def plus(self, other: "MemoryTraffic") -> "MemoryTraffic":
+        return self.model_copy(
+            update={field: getattr(self, field) + getattr(other, field) for field in type(self).model_fields}
+        )
+
+    def scale(self, factor: float) -> "MemoryTraffic":
+        return self.model_copy(update={field: getattr(self, field) * factor for field in type(self).model_fields})
+
+
 class Breakdown(BaseModel):
     energy_pj: float = Field(..., ge=0.0)
     latency_ns: float = Field(..., ge=0.0)
     stages: StageBreakdown
     components: ComponentBreakdown | None = None
     activation_counts: AnalogActivationCounts | None = None
+    memory_traffic: MemoryTraffic | None = None
 
     @classmethod
     def from_stage_breakdown(
@@ -164,14 +213,15 @@ class Breakdown(BaseModel):
         stages: StageBreakdown,
         components: ComponentBreakdown | None = None,
         activation_counts: AnalogActivationCounts | None = None,
+        memory_traffic: MemoryTraffic | None = None,
     ) -> "Breakdown":
         energy = sum(
             getattr(stages, f"{s}_energy_pj")
-            for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"]
+            for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache", "buffers_add", "control"]
         )
         latency = sum(
             getattr(stages, f"{s}_latency_ns")
-            for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"]
+            for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache", "buffers_add", "control"]
         )
         return cls(
             energy_pj=energy,
@@ -179,6 +229,7 @@ class Breakdown(BaseModel):
             stages=stages,
             components=components,
             activation_counts=activation_counts,
+            memory_traffic=memory_traffic,
         )
 
     def scale(self, factor: float) -> "Breakdown":
@@ -192,18 +243,33 @@ class Breakdown(BaseModel):
         activation_counts = None
         if self.activation_counts is not None:
             activation_counts = self.activation_counts.scale(factor)
+        memory_traffic = None
+        if self.memory_traffic is not None:
+            memory_traffic = self.memory_traffic.scale(factor)
         return Breakdown(
             energy_pj=self.energy_pj * factor,
             latency_ns=self.latency_ns * factor,
             stages=self.stages.model_copy(
                 update={
                     f"{s}_{m}": getattr(self.stages, f"{s}_{m}") * factor
-                    for s in ["qkv", "wo", "ffn", "qk", "pv", "softmax", "elementwise", "kv_cache"]
+                    for s in [
+                        "qkv",
+                        "wo",
+                        "ffn",
+                        "qk",
+                        "pv",
+                        "softmax",
+                        "elementwise",
+                        "kv_cache",
+                        "buffers_add",
+                        "control",
+                    ]
                     for m in ["energy_pj", "latency_ns"]
                 }
             ),
             components=components,
             activation_counts=activation_counts,
+            memory_traffic=memory_traffic,
         )
 
 
