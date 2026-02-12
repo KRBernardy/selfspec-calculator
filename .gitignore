@@ -6,3 +6,8 @@ build/
 dist/
 *.egg-info/
 reference/
+
+.claude
+.codex
+.github
+.opencode
