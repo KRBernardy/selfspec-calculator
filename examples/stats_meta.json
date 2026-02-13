@@ -1,0 +1,79 @@
+{
+  "aggregation": {
+    "compile_warmup_excluded": false,
+    "total_bursts": 14
+  },
+  "created_at": "2026-02-12T13:39:52.425216Z",
+  "env": {
+    "platform": "Linux-6.1.0-35-amd64-x86_64-with-glibc2.42",
+    "python": "3.11.2"
+  },
+  "generation": {
+    "batch_size": 1,
+    "is_chat": false,
+    "max_new_tokens": 64,
+    "num_samples": 1,
+    "prompt_length": 5,
+    "speculate_k": 5,
+    "temperature": 0.0,
+    "top_k": 200
+  },
+  "git": {
+    "commit": "8d7eaf6e88a0c8e93234e81c6b3428fd34bf9325",
+    "dirty": true
+  },
+  "knobs": {
+    "attention_backend": "sdpa",
+    "compile": false,
+    "compile_block_mask": false,
+    "compile_prefill": false,
+    "device": "cpu",
+    "draft_dequantize_int8": false,
+    "draft_device": "cpu",
+    "draft_fake_act_quant_int8": false,
+    "draft_noise_level_stds": [
+      0.0,
+      0.001,
+      0.001,
+      0.001
+    ],
+    "draft_noise_levels": [
+      1
+    ],
+    "draft_noise_seed": 1234,
+    "draft_noise_std": [
+      0.0
+    ],
+    "draft_post_matmul_quant_bits": 0,
+    "int8_act_quant": false,
+    "post_matmul_quant_bits": 0,
+    "read_noise_std": 0.0
+  },
+  "model": {
+    "checkpoint_path": "checkpoints/Qwen/Qwen3-0.6B/model.pth",
+    "draft_checkpoint_path": "checkpoints/Qwen/Qwen3-0.6B/model.pth",
+    "tokenizer_path": "checkpoints/Qwen/Qwen3-0.6B/tokenizer.json"
+  },
+  "paths": {
+    "stats": "out/compare_cpu_sdpa_noise_level1/stats.json",
+    "stats_meta": "out/compare_cpu_sdpa_noise_level1/stats_meta.json"
+  },
+  "run_id": "compare_cpu_sdpa_noise_level1",
+  "seeds": {
+    "sample_seed": 1234
+  },
+  "stats": {
+    "acceptance_probs": [
+      0.14285714285714285,
+      0.14285714285714285,
+      0.07142857142857142,
+      0.0,
+      0.0,
+      0.6428571428571429
+    ],
+    "counts_kind": "counts",
+    "k": 5,
+    "mean_accepted": 3.5,
+    "total_bursts": 14.0
+  }
+}
